@@ -1,4 +1,4 @@
-# tools project gitattributes file
+# go-darwin/tools project gitattributes file
 #  https://github.com/github/linguist/blob/master/docs/overrides.md
 
 # To prevent CRLF breakages on Windows for fragile files, like testdata.
