@@ -4,16 +4,14 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 
-	"github.com/go-clang/clang-v3.9/clang"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	flag "github.com/spf13/pflag"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
@@ -21,473 +19,56 @@ const (
 	exitFailure
 )
 
-var (
-	flagMode    []string
-	flagPackage string
-	flagFiles   []string
-	flagSource  []string
+const (
+	fnamePackage      = "package"
+	fnameMode         = "mode"
+	fnameHeader       = "header"
+	fnameArg          = "arg"
+	fnameSource       = "source"
+	fnamegIgnoreMacro = "ignore-macro"
+	fnameConfig       = "config"
+	fnameDebug        = "debug"
 )
 
+var (
+	flagPackage      string
+	flagMode         []string
+	flagHeaders      []string
+	flagArgs         []string
+	flagSources      []string
+	flagIgnoreMacros []string
+	flagConfig       string
+	flagDebug        bool
+)
+
+var log logr.Logger
+
 func main() {
-	flag.StringSliceVar(&flagMode, "mode", []string{"enum, func, type"}, "generate mode")
-	flag.StringVar(&flagPackage, "package", "", "package name of godef")
-	flag.StringSliceVar(&flagFiles, "files", nil, "files to analyze")
-	flag.StringSliceVar(&flagSource, "sources", nil, "C sources to analyze")
+	flag.StringVar(&flagPackage, fnamePackage, "", "package name of godef")
+	flag.StringSliceVar(&flagMode, fnameMode, []string{"enum, func, type"}, "generate mode")
+	flag.StringSliceVar(&flagHeaders, fnameHeader, nil, "C header to analyze")
+	flag.StringSliceVar(&flagArgs, fnameArg, nil, "arg for analyze")
+	flag.StringSliceVar(&flagSources, fnameSource, nil, "additional C source to analyze")
+	flag.StringSliceVar(&flagIgnoreMacros, fnamegIgnoreMacro, nil, "ignore macro names")
+	flag.StringVar(&flagConfig, fnameConfig, "", "config file to analyze")
+	flag.BoolVar(&flagDebug, fnameDebug, false, "debug log output")
 	flag.Parse()
 
-	os.Exit(run(flag.Args()))
-}
+	lvl := zap.NewAtomicLevelAt(zapcore.InfoLevel)
+	zl, err := zap.NewDevelopment(zap.IncreaseLevel(lvl), zap.AddCaller(), zap.AddStacktrace(zapcore.DebugLevel))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "new zap development logger: %v\n", err)
+		os.Exit(int(exitFailure))
+	}
+	if flagDebug {
+		lvl.SetLevel(zapcore.DebugLevel)
+	}
+	log = zapr.NewLogger(zl)
 
-func run(args []string) int {
-	if flagFiles == nil {
-		flag.Usage()
-		fmt.Printf("please provide a file name to analyze\n")
-
-		return 1
+	cmd := flag.Arg(0)
+	if cmd == "fix" {
+		os.Exit(fix(os.Stdin))
 	}
 
-	idx := clang.NewIndex(1, 0)
-	defer idx.Dispose()
-
-	clangFlags := uint32(
-		clang.TranslationUnit_DetailedPreprocessingRecord |
-			clang.TranslationUnit_Incomplete |
-			clang.TranslationUnit_PrecompiledPreamble |
-			clang.TranslationUnit_ForSerialization |
-			clang.TranslationUnit_CXXChainedPCH |
-			clang.TranslationUnit_CreatePreambleOnFirstParse |
-			clang.TranslationUnit_KeepGoing,
-	)
-
-	var sb strings.Builder
-	m := make(map[clang.Cursor][]string)
-	enumMap := make(map[clang.Cursor][]clang.Cursor)
-
-	for i := 0; i < len(flagFiles); i++ {
-		filename := flagFiles[i]
-
-		tu := idx.ParseTranslationUnit(filename, args, nil, clangFlags)
-		defer tu.Dispose()
-
-		visit := func(cursor, parent clang.Cursor) clang.ChildVisitResult {
-			if cursor.IsNull() {
-				return clang.ChildVisit_Continue
-			}
-
-			file, _, _, _ := cursor.Location().FileLocation()
-			if !strings.Contains(file.Name(), filepath.Dir(filename)) {
-				return clang.ChildVisit_Continue
-			}
-
-			var skip bool
-			switch kind := cursor.Kind(); kind {
-			case clang.Cursor_FunctionDecl: // function
-				p(&sb, "func %s(", upperCamelCase(cursor.Spelling()))
-				numArgs := cursor.NumArguments()
-				for i := int32(0); i < numArgs; i++ {
-					argName := lowerCamelCase(cursor.Argument(uint32(i)).Spelling())
-					argType := convertGoType(cursor.Argument(uint32(i)).Type().Spelling())
-
-					p(&sb, "%s %s", argName, argType)
-					if i+1 < numArgs {
-						p(&sb, ", ")
-					}
-				}
-				p(&sb, ") %s\n", convertGoType(cursor.ResultType().Spelling()))
-
-				m[cursor] = append(m[cursor], sb.String())
-				sb.Reset()
-
-				return clang.ChildVisit_Recurse
-
-			case clang.Cursor_EnumDecl: // enum type
-				enumMap[cursor] = []clang.Cursor{}
-
-				return clang.ChildVisit_Recurse
-
-			case clang.Cursor_EnumConstantDecl: // enum constant
-				enumMap[parent] = append(enumMap[parent], cursor)
-
-				return clang.ChildVisit_Recurse
-
-			case clang.Cursor_TypedefDecl: // type
-				switch kind {
-				case clang.Cursor_VarDecl: // variable type
-					p(&sb, "type %s C.%s\n", strings.TrimSuffix(upperCamelCase(cursor.DisplayName()), "T"), cursor.DisplayName())
-					m[cursor] = append(m[cursor], sb.String())
-					sb.Reset()
-
-				case clang.Cursor_UnionDecl:
-					p(&sb, "type %s C.union_%s\n", upperCamelCase(cursor.DisplayName()), cursor.DisplayName())
-					m[cursor] = append(m[cursor], sb.String())
-					sb.Reset()
-
-				default:
-					m[cursor] = append(m[cursor], cursor.DisplayName())
-				}
-
-				return clang.ChildVisit_Recurse
-
-			case clang.Cursor_MacroDefinition: // skip include guard
-				skip = true
-
-				return clang.ChildVisit_Continue
-
-			case clang.Cursor_MacroExpansion: // const
-				defer func() { skip = false }()
-				if skip {
-					return clang.ChildVisit_Continue
-				}
-				if cursor.DisplayName() == "CAPSTONE_API" {
-					return clang.ChildVisit_Continue
-				}
-				if cursor.DisplayName() == "__GNUC__" {
-					return clang.ChildVisit_Continue
-				}
-
-				p(&sb, "const %s = C.%s\n", upperCamelCase(strings.ToLower(cursor.DisplayName())), cursor.DisplayName())
-
-				m[cursor] = append(m[cursor], sb.String())
-				sb.Reset()
-
-				return clang.ChildVisit_Recurse
-
-			case clang.Cursor_VisibilityAttr, // skip
-				clang.Cursor_InclusionDirective,
-				clang.Cursor_ParmDecl,
-				clang.Cursor_TypeRef,
-				clang.Cursor_DeclRefExpr:
-
-				return clang.ChildVisit_Continue
-
-			default:
-				m[cursor] = append(m[cursor], cursor.DisplayName())
-
-				return clang.ChildVisit_Continue
-			}
-		}
-
-		cursor := tu.TranslationUnitCursor()
-		cursor.Visit(visit)
-	}
-
-	bio := bufio.NewWriter(os.Stdout)
-	bio2 := bufio.NewWriter(os.Stderr)
-	p(bio, "// Code generated by github.com/go-darwin/tools/cmd/mkgodef; DO NOT EDIT.\n// Input to cgo -godefs.\n\n")
-	p(bio, "//go:build ignore\n// +build ignore\n\n")
-
-	p(bio, "package %s\n\n", flagPackage)
-	if flagFiles != nil || flagSource != nil {
-		p(bio, "/*\n")
-
-		for _, file := range flagFiles {
-			p(bio, "#include <%s>\n", file)
-		}
-		for _, source := range flagSource {
-			p(bio, "%s\n", source)
-		}
-
-		p(bio, "*/\n")
-	}
-	p(bio, "import %q\n\n", "C")
-
-	mode := strings.Join(flagMode, " ")
-
-	if strings.Contains(mode, "enum") {
-		cursors := make([]clang.Cursor, len(enumMap))
-		i := 0
-		for cursor := range enumMap {
-			cursors[i] = cursor
-			i++
-		}
-		sort.Slice(cursors, func(i, j int) bool { return cursors[i].Spelling() < cursors[j].Spelling() })
-
-		for parent := range enumMap {
-			sort.Slice(enumMap[parent], func(i, j int) bool { return enumMap[parent][i].Kind() < enumMap[parent][j].Kind() })
-		}
-
-		seenCursor := make(map[clang.Cursor]bool)
-		for _, cursor := range cursors {
-			parent := cursor
-			curs := enumMap[cursor]
-
-			parentName := upperCamelCase(parent.DisplayName())
-			p(bio, "type %s C.%s\n\n", parentName, parent.DisplayName())
-
-			p(bio, "const (\n")
-
-			for _, cur := range curs {
-				if seenCursor[cur] {
-					continue
-				}
-				seenCursor[cur] = true
-
-				name := strings.TrimPrefix(cur.DisplayName(), "CS_")
-				str := fmt.Sprintf("%s %s = C.%s", name, parentName, cur.DisplayName())
-				p(bio, "\t%s\n", str)
-			}
-
-			p(bio, ")\n\n")
-		}
-	}
-
-	if strings.Contains(mode, "func") {
-		cursors := make([]clang.Cursor, len(m))
-		i := 0
-		for cursor := range m {
-			cursors[i] = cursor
-			i++
-		}
-		sort.Slice(cursors, func(i, j int) bool { return cursors[i].DisplayName() < cursors[j].DisplayName() })
-
-		seen := make(map[string]bool)
-		for _, cursor := range cursors {
-			ss := m[cursor]
-
-			switch cursor.Kind() {
-			case clang.Cursor_FunctionDecl:
-				for _, s := range ss {
-					if seen[s] {
-						continue
-					}
-					seen[s] = true
-
-					bio.WriteString(s)
-				}
-			}
-		}
-	}
-
-	if strings.Contains(mode, "type") {
-		cursors := make([]clang.Cursor, len(m))
-		i := 0
-		for cursor := range m {
-			cursors[i] = cursor
-			i++
-		}
-		sort.Slice(cursors, func(i, j int) bool { return cursors[i].DisplayName() < cursors[j].DisplayName() })
-
-		seen := make(map[string]bool)
-		for _, cursor := range cursors {
-			ss := m[cursor]
-
-			switch cursor.Kind() {
-			case clang.Cursor_VarDecl, clang.Cursor_UnionDecl, clang.Cursor_MacroExpansion:
-				for _, s := range ss {
-					if seen[s] {
-						continue
-					}
-					seen[s] = true
-
-					bio.WriteString(s)
-				}
-
-			case clang.Cursor_StructDecl:
-				for _, s := range ss {
-					if seen[s] {
-						continue
-					}
-					seen[s] = true
-
-					bio.WriteString(fmt.Sprintf("type %s C.struct_%s\n", upperCamelCase(s), s))
-				}
-
-			case clang.Cursor_TypedefDecl:
-				for _, s := range ss {
-					if seen[s] {
-						continue
-					}
-					seen[s] = true
-
-					argName := upperCamelCase(s)
-					if argName == "h" {
-						argName = strings.ToUpper("CS" + argName)
-					}
-					bio.WriteString(fmt.Sprintf("type %s C.%s\n", argName, s))
-				}
-
-			case clang.Cursor_FunctionDecl:
-				// nothing to do
-
-			default:
-				for _, s := range ss {
-					if seen[s] || s == "" {
-						continue
-					}
-					seen[s] = true
-
-					bio2.WriteString(fmt.Sprintf("kind: %s, %s\n", cursor.Kind(), s))
-				}
-			}
-		}
-	}
-
-	bio.Flush()
-	bio2.Flush()
-
-	return exitSuccess
-}
-
-func p(w io.Writer, format string, a ...interface{}) {
-	fmt.Fprintf(w, format, a...)
-}
-
-var builtinCTypeMap = map[string]string{
-	// size_t -> uint64
-	"size_t": "uint64",
-	// char -> byte
-	"char": "string",
-	// signed char -> int8
-	"signed char": "int8",
-	// unsigned char -> unsigned byte
-	"unsigned char": "byte",
-	// short -> int16
-	"short": "int16",
-	// unsigned short -> uint16
-	"unsigned short": "uint16",
-	// long -> int
-	"long": "int",
-	// unsigned long -> uint
-	"unsigned long": "uint",
-	// signed long -> int
-	"signed long": "int",
-	// long long -> int64
-	"long long": "int64",
-	// unsigned long long -> uint64
-	"unsigned long long": "uint64",
-	// signed long long -> int64
-	"signed long long": "int64",
-	// int -> int32
-	"int": "int32",
-	// unsigned int -> uint32
-	"unsigned int": "uint32",
-	// uint8_t -> uint8
-	"uint8_t": "uint8",
-	// uint16_t -> uint16
-	"uint16_t": "uint16",
-	// uint32_t -> uint32
-	"uint32_t": "uint32",
-	// uint64_t -> uint64
-	"uint64_t": "uint64",
-	// int8_t -> int8
-	"int8_t": "int8",
-	// int16_t -> int16
-	"int16_t": "int16",
-	// int32_t -> int32
-	"int32_t": "int32",
-	// int64_t -> int64
-	"int64_t": "int64",
-	// signed int -> int32
-	"signed int": "int32",
-	// short int -> int16
-	"short int": "int16",
-	// unsigned short int -> uint16
-	"unsigned short int": "uint16",
-	// signed short int -> uint16
-	"signed short int": "uint16",
-	// long int -> int
-	"long int": "int",
-	// unsigned long int -> uint
-	"unsigned long int": "uint",
-	// signed long int -> uint
-	"signed long int": "uint",
-	// float -> float32
-	"float": "float32",
-	// double -> float64
-	"double": "float64",
-	// long double -> float64
-	"long double": "float64",
-	// complex float -> complex164
-	"complex float": "complex164",
-	// complex double -> complex128
-	"complex double": "complex128",
-	// long complex double -> complex128
-	"long complex double": "complex128",
-	// void* -> unsafe.Pointer
-	"void *": "unsafe.Pointer",
-	// void -> [0]byte
-	"void": "",
-	// _Bool -> bool
-	"_Bool": "bool",
-}
-
-func convertGoType(s string) string {
-	argType := strings.ReplaceAll(s, "const ", "")          // trim const
-	argType = strings.TrimSpace(strings.Trim(argType, "*")) // trim pointer
-	if goType, ok := builtinCTypeMap[argType]; ok {
-		argType = goType
-	} else {
-		argType = upperCamelCase(argType) // export type
-		if strings.Contains(s, "csh") {
-			argType = "CS" + strings.ToUpper(argType)
-		}
-	}
-
-	return argType
-}
-
-func upperCamelCase(s string) string {
-	s = strings.ToLower(s)
-	s = goCamelCase(s)
-	s = string(strings.ToUpper(string(s[0])) + s[1:])
-
-	return strings.TrimPrefix(s, "Cs")
-}
-
-func lowerCamelCase(s string) string {
-	s = goCamelCase(s)
-	s = string(strings.ToLower(string(s[0])) + s[1:])
-
-	return strings.TrimPrefix(s, "cS")
-}
-
-// goCamelCase camel-cases Go identifier name.
-func goCamelCase(s string) string {
-	var b []byte
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-
-		switch {
-		case c == '.' && i+1 < len(s) && isASCIILower(s[i+1]):
-			// skip over '.' in ".{{lowercase}}".
-
-		case c == '.':
-			b = append(b, '_') // convert '.' to '_'
-
-		case c == '_' && (i == 0 || s[i-1] == '.'):
-			// skip over '_'
-
-		case c == '_' && i+1 < len(s) && isASCIILower(s[i+1]):
-			// skip over '_' in "_{{lowercase}}".
-
-		case isASCIIDigit(c):
-			b = append(b, c)
-
-		default:
-			// Assume we have a letter now - if not, it's a bogus identifier.
-			// The next word is a sequence of characters that must start upper case.
-			if isASCIILower(c) {
-				c -= 'a' - 'A' // convert lowercase to uppercase
-			}
-			b = append(b, c)
-
-			// Accept lower case sequence that follows.
-			for ; i+1 < len(s) && isASCIILower(s[i+1]); i++ {
-				b = append(b, s[i+1])
-			}
-		}
-	}
-
-	return string(b)
-}
-
-func isASCIILower(c byte) bool {
-	return 'a' <= c && c <= 'z'
-}
-func isASCIIUpper(c byte) bool {
-	return 'A' <= c && c <= 'Z'
-}
-func isASCIIDigit(c byte) bool {
-	return '0' <= c && c <= '9'
+	os.Exit(run(flag.CommandLine, flag.Args()))
 }
