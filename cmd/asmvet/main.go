@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2021 The Go Darwin Authors
+// Copyright 2021 The Go Darwin Authors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Command asmvet checks for correctness of Go assembly and some low-level operations.
