@@ -123,7 +123,7 @@ func ConfigFromFlags(flags *flag.FlagSet) (config *Config, err error) {
 	}, nil
 }
 
-func run(flags *flag.FlagSet, _ []string) int {
+func run(flags *flag.FlagSet) int {
 	config, err := ConfigFromFlags(flags)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse configs: %v\n", err)
@@ -152,11 +152,11 @@ func run(flags *flag.FlagSet, _ []string) int {
 			clang.TranslationUnit_ForSerialization |
 			clang.TranslationUnit_CXXChainedPCH |
 			clang.TranslationUnit_CreatePreambleOnFirstParse |
-			clang.TranslationUnit_KeepGoing,
+			clang.TranslationUnit_KeepGoing |
+			clang.TranslationUnit_IncludeAttributedTypes,
 	)
 
-	var sb strings.Builder
-	funcMap := make(map[clang.Cursor][]string)
+	funcMap := make(map[string]clang.Cursor)
 	typeMap := make(map[clang.CursorKind][]clang.Cursor)
 	enumMap := make(map[clang.Cursor][]clang.Cursor)
 
@@ -166,8 +166,8 @@ func run(flags *flag.FlagSet, _ []string) int {
 		tu := idx.ParseTranslationUnit(header, config.Args, nil, clangFlags)
 		defer tu.Dispose()
 
-		var visit func(cursor, parent clang.Cursor) clang.ChildVisitResult
-		visit = func(cursor, parent clang.Cursor) clang.ChildVisitResult {
+		cursor := tu.TranslationUnitCursor()
+		cursor.Visit(func(cursor, parent clang.Cursor) clang.ChildVisitResult {
 			if cursor.IsNull() {
 				return clang.ChildVisit_Continue
 			}
@@ -181,22 +181,7 @@ func run(flags *flag.FlagSet, _ []string) int {
 			var skip bool
 			switch kind := cursor.Kind(); kind {
 			case clang.Cursor_FunctionDecl: // function
-				p(&sb, "//sys func %s(", upperCamelCase(cursor.Spelling()))
-
-				numArgs := cursor.NumArguments()
-				for i := int32(0); i < numArgs; i++ {
-					argName := strings.TrimSpace(lowerCamelCase(cursor.Argument(uint32(i)).DisplayName()))
-					argType := convertGoType(cursor.Argument(uint32(i)).Type().CanonicalType().Spelling())
-
-					p(&sb, "%s %s", argName, argType)
-					if i+1 < numArgs {
-						p(&sb, ", ")
-					}
-				}
-				p(&sb, ") %s\n", convertGoType(cursor.ResultType().Spelling()))
-
-				funcMap[cursor] = append(funcMap[cursor], sb.String())
-				sb.Reset()
+				funcMap[cursor.Spelling()] = cursor
 
 				return clang.ChildVisit_Recurse
 
@@ -265,10 +250,7 @@ func run(flags *flag.FlagSet, _ []string) int {
 
 				return clang.ChildVisit_Continue
 			}
-		}
-
-		cursor := tu.TranslationUnitCursor()
-		cursor.Visit(visit)
+		})
 	}
 
 	var buf bytes.Buffer
@@ -471,29 +453,42 @@ func run(flags *flag.FlagSet, _ []string) int {
 
 	if mode&FuncMode != 0 {
 		// sort funcMap by DisplayName
-		cursors := make([]clang.Cursor, len(funcMap))
+		fns := make([]string, len(funcMap))
 		i := 0
-		for cursor := range funcMap {
-			cursors[i] = cursor
+		for fn := range funcMap {
+			fns[i] = fn
 			i++
 		}
-		sort.Slice(cursors, func(i, j int) bool { return cursors[i].DisplayName() < cursors[j].DisplayName() })
+		sort.Strings(fns)
 
+		var sb strings.Builder
 		seenFn := make(map[string]bool)
-		for _, cursor := range cursors {
-			ss := funcMap[cursor]
+		for _, fn := range fns {
+			cursor := funcMap[fn]
+			if seenFn[fn] {
+				log.V(1).Info("ignore", "s", fn, "kind", cursor.Kind())
+				continue
+			}
+			seenFn[fn] = true
 
 			switch cursor.Kind() {
 			case clang.Cursor_FunctionDecl:
-				for _, s := range ss {
-					if seenFn[s] {
-						log.V(1).Info("ignore", "s", s, "kind", cursor.Kind())
-						continue
-					}
-					seenFn[s] = true
+				p(&sb, "//sys func %s(", upperCamelCase(cursor.Spelling()))
 
-					bio.WriteString(s)
+				numArgs := cursor.NumArguments()
+				for i := int32(0); i < numArgs; i++ {
+					argName := strings.TrimSpace(lowerCamelCase(cursor.Argument(uint32(i)).DisplayName()))
+					argType := convertGoType(cursor.Argument(uint32(i)).Type().CanonicalType().Spelling())
+
+					p(&sb, "%s %s", argName, argType)
+					if i+1 < numArgs {
+						p(&sb, ", ")
+					}
 				}
+				p(&sb, ") %s\n", convertGoType(cursor.ResultType().Spelling()))
+
+				bio.WriteString(sb.String())
+				sb.Reset()
 			}
 		}
 	}

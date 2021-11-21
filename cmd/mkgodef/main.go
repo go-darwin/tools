@@ -70,5 +70,5 @@ func main() {
 		os.Exit(fix(os.Stdin))
 	}
 
-	os.Exit(run(flag.CommandLine, flag.Args()))
+	os.Exit(run(flag.CommandLine))
 }
