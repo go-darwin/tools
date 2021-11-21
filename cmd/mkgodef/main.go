@@ -45,7 +45,7 @@ var log logr.Logger
 
 func main() {
 	flag.StringVar(&flagPackage, fnamePackage, "", "package name of godef")
-	flag.StringSliceVar(&flagMode, fnameMode, []string{"enum, func, type"}, "generate mode")
+	flag.StringSliceVar(&flagMode, fnameMode, []string{"enum, func, type, rawfunc"}, "generate mode")
 	flag.StringSliceVar(&flagHeaders, fnameHeader, nil, "C header to analyze")
 	flag.StringSliceVar(&flagArgs, fnameArg, nil, "arg for analyze")
 	flag.StringSliceVar(&flagSources, fnameSource, nil, "additional C source to analyze")

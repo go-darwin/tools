@@ -44,6 +44,7 @@ const (
 	EnumMode = 1 << iota
 	TypeMode
 	FuncMode
+	RawFuncMode
 )
 
 // Config represents a mkgodef config.
@@ -280,6 +281,8 @@ func run(flags *flag.FlagSet) int {
 			mode |= TypeMode
 		case "func":
 			mode |= FuncMode
+		case "rawfunc":
+			mode |= RawFuncMode
 		}
 	}
 
@@ -486,6 +489,48 @@ func run(flags *flag.FlagSet) int {
 					}
 				}
 				p(&sb, ") %s\n", convertGoType(cursor.ResultType().Spelling()))
+
+				bio.WriteString(sb.String())
+				sb.Reset()
+			}
+		}
+	}
+
+	if mode&RawFuncMode != 0 {
+		// sort funcMap by DisplayName
+		fns := make([]string, len(funcMap))
+		i := 0
+		for fn := range funcMap {
+			fns[i] = fn
+			i++
+		}
+		sort.Strings(fns)
+
+		var sb strings.Builder
+		seenFn := make(map[string]bool)
+		for _, fn := range fns {
+			cursor := funcMap[fn]
+			if seenFn[fn] {
+				log.V(1).Info("ignore", "s", fn, "kind", cursor.Kind())
+				continue
+			}
+			seenFn[fn] = true
+
+			switch cursor.Kind() {
+			case clang.Cursor_FunctionDecl:
+				p(&sb, "//sys func %s(", cursor.Spelling())
+
+				numArgs := cursor.NumArguments()
+				for i := int32(0); i < numArgs; i++ {
+					argName := cursor.Argument(uint32(i)).DisplayName()
+					argType := cursor.Argument(uint32(i)).Type().CanonicalType().Spelling()
+
+					p(&sb, "%s %s", argName, argType)
+					if i+1 < numArgs {
+						p(&sb, ", ")
+					}
+				}
+				p(&sb, ") %s\n", cursor.ResultType().Spelling())
 
 				bio.WriteString(sb.String())
 				sb.Reset()
