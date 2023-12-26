@@ -54,7 +54,7 @@ func (f *File) ParseGo(abspath string, src []byte) {
 	// In cgo mode, we ignore ast2 and just apply edits directly
 	// the text behind ast1. In godefs mode we modify and print ast2.
 	ast1 := parse(abspath, src, parser.SkipObjectResolution|parser.ParseComments)
-	ast2 := parse(abspath, src, parser.SkipObjectResolution)
+	ast2 := parse(abspath, src, parser.SkipObjectResolution|parser.ParseComments)
 
 	f.Package = ast1.Name.Name
 	f.Name = make(map[string]*Name)
@@ -115,6 +115,7 @@ func (f *File) ParseGo(abspath string, src []byte) {
 		error_(ast1.Package, `cannot find import "C"`)
 	}
 
+	var comments []*ast.CommentGroup
 	// In ast2, strip the import "C" line.
 	if *godefs {
 		w := 0
@@ -137,6 +138,7 @@ func (f *File) ParseGo(abspath string, src []byte) {
 				continue
 			}
 			d.Specs = d.Specs[0:ws]
+			ast2.Comments = ast2.Comments[ws:]
 			ast2.Decls[w] = d
 			w++
 		}
@@ -157,6 +159,7 @@ func (f *File) ParseGo(abspath string, src []byte) {
 			}
 		}
 	}
+	ast2.Comments = comments
 
 	// Accumulate pointers to uses of C.x.
 	if f.Ref == nil {
